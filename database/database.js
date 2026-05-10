@@ -245,10 +245,6 @@
 
 
 
-
-
-
-
 /**
  * database.js — SQLite wrapper using sql.js (pure JavaScript)
  *
@@ -291,11 +287,33 @@ class Database {
   }
 
   _save() {
+    // Debounced async write — coalesces rapid saves into one disk write.
+    // 500ms window: with 300 workers finishing simultaneously, this prevents
+    // hundreds of WebAssembly db.export() calls blocking the event loop.
+    if (this._saveTimer) return;
+    this._saveTimer = setTimeout(() => {
+      this._saveTimer = null;
+      // setImmediate yields to event loop before the expensive wasm export()
+      setImmediate(() => {
+        try {
+          const data = this.db.export();
+          fs.writeFile(this.dbPath, Buffer.from(data), (err) => {
+            if (err) console.error('DB save error:', err.message);
+          });
+        } catch (err) {
+          console.error('DB save error:', err.message);
+        }
+      });
+    }, 500);
+  }
+
+  _saveSync() {
+    // Used only at shutdown / close — synchronous is fine there
     try {
       const data = this.db.export();
       fs.writeFileSync(this.dbPath, Buffer.from(data));
     } catch (err) {
-      console.error('DB save error:', err.message);
+      console.error('DB saveSync error:', err.message);
     }
   }
 
@@ -376,7 +394,7 @@ class Database {
   // ── Accounts ──────────────────────────────────────────────────────────────
 
   getAllAccounts() {
-    return this._all('SELECT * FROM accounts ORDER BY created_at DESC');
+    return this._all('SELECT * FROM accounts ORDER BY id ASC');
   }
 
   addAccount(username, password, score = 0) {
@@ -401,7 +419,6 @@ class Database {
     return { added, duplicates };
   }
 
-  // FIXED: Removed padStart - no leading zeros
   generateAccounts(username, startRange, endRange, password) {
     // Always parseInt to avoid string-loop bugs (e.g. "1" to "100" skipping numbers)
     const start = parseInt(startRange, 10);
@@ -409,21 +426,30 @@ class Database {
     if (isNaN(start) || isNaN(end) || start > end) return { added: 0, duplicates: 0 };
     const rows = [];
     for (let i = start; i <= end; i++) {
-      // No padStart — user1..user100, not user001..user100
+      // No padStart — Rx1..Rx1000, not Rx001..Rx1000
       rows.push({ username: `${username}${i}`, password, score: 0 });
     }
     return this.bulkAdd(rows);
   }
 
   updateAccount(account) {
-    return this._run(
-      `UPDATE accounts
-         SET username=?, password=?, score=?, userid=?, dynamicpass=?,
-             last_processed=datetime('now'), updated_at=datetime('now')
-       WHERE id=?`,
-      [account.username, account.password, account.score || 0,
-       account.userid || null, account.dynamicpass || null, account.id]
-    );
+    // Fire-and-forget: called 500x per run. setImmediate prevents blocking workers.
+    setImmediate(() => {
+      try {
+        this.db.run(
+          `UPDATE accounts
+             SET username=?, password=?, score=?, userid=?, dynamicpass=?,
+                 last_processed=datetime('now'), updated_at=datetime('now')
+           WHERE id=?`,
+          [account.username, account.password, account.score || 0,
+           account.userid || null, account.dynamicpass || null, account.id]
+        );
+        this._save();
+      } catch (err) {
+        console.error('DB updateAccount error:', err.message);
+      }
+    });
+    return { changes: 1, lastInsertRowid: account.id }; // optimistic return
   }
 
   deleteAccount(id) {
@@ -442,15 +468,19 @@ class Database {
   getAccountCount() { return this._get('SELECT COUNT(*) as count FROM accounts')?.count || 0; }
 
   // ── Processing Logs ───────────────────────────────────────────────────────
-
+  // IMPORTANT: This is called after EVERY account (500x per user per run).
+  // We make it fully fire-and-forget with setImmediate so it never blocks
+  // a worker from picking up the next account.
   addProcessingLog(accountId, status, message, details = null) {
-    try {
-      this.db.run(
-        'INSERT INTO processing_logs (account_id, status, message, details) VALUES (?, ?, ?, ?)',
-        [accountId, status, message, details ? JSON.stringify(details) : null]
-      );
-      this._save();
-    } catch (_) {}
+    setImmediate(() => {
+      try {
+        this.db.run(
+          'INSERT INTO processing_logs (account_id, status, message, details) VALUES (?, ?, ?, ?)',
+          [accountId, status, message, details ? JSON.stringify(details) : null]
+        );
+        this._save();
+      } catch (_) {}
+    });
   }
 
   // ── Proxy ─────────────────────────────────────────────────────────────────
@@ -493,7 +523,8 @@ class Database {
   // ── Lifecycle ─────────────────────────────────────────────────────────────
 
   close() {
-    try { this._save(); this.db?.close(); } catch (_) {}
+    if (this._saveTimer) { clearTimeout(this._saveTimer); this._saveTimer = null; }
+    try { this._saveSync(); this.db?.close(); } catch (_) {}
   }
 }
 
